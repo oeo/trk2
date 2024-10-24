@@ -72,7 +72,7 @@ domains = [
 # store events in an array before recording
 data = []
 
-numEvents = 10000
+numEvents = 100000
 
 for x in [1..numEvents]
   data.push {
