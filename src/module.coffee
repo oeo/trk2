@@ -7,7 +7,6 @@ minimatch = require 'minimatch'
 RedisMembers = require './members'
 
 englishSecs = require './english-secs'
-identityFn = require './identity'
 timebase = require './timebase'
 
 module.exports = class Metrics
@@ -31,9 +30,29 @@ module.exports = class Metrics
     if opt.map
       @map[k] = v for k,v of opt.map
 
+    # define the custom command in the constructor
+    @redis.defineCommand("getIdentityAndSetBit", {
+      numberOfKeys: 2,
+      lua: """
+        local idMapKey = KEYS[1]
+        local bmpKey = KEYS[2]
+        local id = ARGV[1]
+
+        local identity = redis.call("ZSCORE", idMapKey, id)
+        if not identity then
+          identity = redis.call("ZCARD", idMapKey)
+          redis.call("ZADD", idMapKey, identity, id)
+        end
+
+        redis.call("SETBIT", bmpKey, identity, 1)
+
+        return identity
+      """
+    })
+
   record: (event) ->
-    dkey = @key + ':' + timebase()
-    obj = _.clone(event, false) # shallow copy
+    dkey = @key + ':' + (_timebase = timebase())
+    obj = {...event}
 
     for x of obj
       for y of obj
@@ -44,6 +63,7 @@ module.exports = class Metrics
             obj[key] = obj[cat[0]] + '~' + obj[cat[1]]
 
     pipeline = @redis.pipeline()
+
     keysQueue = []
 
     if @map.bmp?.length
@@ -52,13 +72,13 @@ module.exports = class Metrics
           x = x.split(/\~/).sort().join('~')
 
         if obj[x]
-          bmpId = identityFn(@redis, dkey + ':bmp:i:' + x)
+          idMapKey = dkey + ':bmp:i:' + x
           bmpKey = dkey + ':bmp:' + x
 
-          keysQueue.push bmpKey = dkey + ':bmp:' + x
+          keysQueue.push bmpKey
 
-          id = await bmpId(obj[x])
-          pipeline.setbit(bmpKey, id, 1)
+          # use the command we defined in our pipeline
+          pipeline.getIdentityAndSetBit(idMapKey, bmpKey, obj[x])
 
     if @map.add?.length
       for x in @map.add
@@ -88,7 +108,7 @@ module.exports = class Metrics
           continue
 
         labelKey = x.key
-        valueKey = x.addKey ? x.addKey
+        valueKey = x.addKey
 
         if labelKey.match(/\~/)
           labelKey = labelKey.split(/\~/).sort().join('~')
@@ -106,7 +126,7 @@ module.exports = class Metrics
           pipeline.hincrby(totKey, 'sum', +(obj[valueKey]))
           pipeline.hincrby(totKey, 'count', 1)
 
-    await @membersKeys.add(timebase(), keysQueue)
+    await @membersKeys.add(_timebase, keysQueue)
     await pipeline.exec()
 
   query: (min, max, opt = {}) ->
