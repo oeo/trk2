@@ -43,7 +43,7 @@ await metrics.record({
 ```
 
 <p>
-    <img src="./assets/redis-insight.png" width="600">
+    <img src="https://github.com/oeo/trk2/blob/master/assets/redis-insight.png" width="600">
 </p>
 
 ### querying data

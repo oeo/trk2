@@ -2,6 +2,7 @@
   "name": "trk2",
   "version": "1.0.0",
   "main": "build/module.js",
+  "repository": "https://github.com/oeo/trk2.git",
   "license": "MIT",
   "dependencies": {
     "ioredis": "^5.4.1",
