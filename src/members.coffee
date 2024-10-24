@@ -11,7 +11,6 @@ class RedisMembers
     @redis = opts.redis ? new Redis(6379, 'localhost')
     @prefix = opts.prefix ? 'members'
     @opts = {
-      trimValues: opts.trimValues ? yes
       hashGroupNames: opts.hashGroupNames ? no
       cacheTime: etime(opts.cacheTime ? '10 minutes') * 1000
     }
@@ -20,7 +19,7 @@ class RedisMembers
     key = @_getKey(groupName)
 
     if typeof member is 'string'
-      member = @_trim(member)
+      member = member.trim()
       cacheKey = key + member
 
       if not cache.get(cacheKey)
@@ -35,7 +34,7 @@ class RedisMembers
       pipeline = @redis.pipeline()
 
       for x in member
-        x = @_trim(x.toString())
+        x = x.toString().trim()
         cacheKey = key + x
 
         if not cache.get(cacheKey)
@@ -55,7 +54,7 @@ class RedisMembers
     pipeline = @redis.pipeline()
 
     for x in members
-      x = @_trim(x)
+      x = x.trim()
       cacheKey = key + x
       cache.del(cacheKey)
       pipeline.srem(key, x)
@@ -77,12 +76,9 @@ class RedisMembers
 
   _getKey: (groupName) ->
     if @opts.hashGroupNames
-      "#{@prefix}:#{@_sha(groupName)}:"
+      "#{@prefix}:#{@_sha(groupName)}"
     else
-      "#{@prefix}:#{groupName}:"
-
-  _trim: (value) ->
-    if @opts.trimValues then value.trim() else value
+      "#{@prefix}:#{groupName}"
 
   _sha: (str) ->
     crypto.createHash('sha256').update(str).digest('hex')

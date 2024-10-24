@@ -1,13 +1,25 @@
 # vim: set expandtab tabstop=2 shiftwidth=2 softtabstop=2
+
 _ = require 'lodash'
 Redis = require 'ioredis'
-moment = require 'moment'
-{ promisify } = require 'util'
+minimatch = require 'minimatch'
 
-class Metrics
-  constructor: (options = {}) ->
-    @redis = options.redis ? new Redis(options.redisUrl)
-    @key = options.key ? 'metrics'
+RedisMembers = require './members'
+
+englishSecs = require './english-secs'
+identityFn = require './identity'
+timebase = require './timebase'
+
+module.exports = class Metrics
+
+  constructor: (opt={}) ->
+    @redis = opt.redis ? opt.client ? new Redis()
+    @key = opt.key ? opt.prefix ? 'trk2'
+
+    @membersKeys = new RedisMembers {
+      redis: @redis
+      prefix: @key + ':k'
+    }
 
     @map = {
       bmp: []
@@ -16,200 +28,482 @@ class Metrics
       top: []
     }
 
-    @map = {...@map, ...options.map} if options.map
+    if opt.map
+      @map[k] = v for k,v of opt.map
 
   record: (event) ->
-    dkey = "#{@key}:#{moment().format('YYYYMMDD')}"
-    obj = _.cloneDeep(event)
+    dkey = @key + ':' + timebase()
 
-    # combine and sort keys
+    obj = _.clone event
+
     for x of obj
       for y of obj
-        if x isnt y and not x.includes('~') and not y.includes('~')
-          cat = [x, y].sort()
+        if x != y and !x.match(/\~/) and !y.match(/\~/)
+          cat = [x,y].sort()
           key = cat.join('~')
-          if not obj[key]?
-            obj[key] = "#{obj[cat[0]]}~#{obj[cat[1]]}"
+          if not obj[key]
+            obj[key] = obj[cat[0]] + '~' + obj[cat[1]]
 
     pipeline = @redis.pipeline()
+    keysQueue = []
 
-    # process each map type
-    for mapType, keys of @map
-      for x in keys
+    if @map.bmp?.length
+      for x in @map.bmp
+        if x.match(/\~/)
+          x = x.split(/\~/).sort().join('~')
 
-        # sort compound keys
-        if x.includes('~')
-          x = x.split('~').sort().join('~')
+        if obj[x]
+          bmpId = identityFn(@redis, dkey + ':bmp:i:' + x)
+          bmpKey = dkey + ':bmp:' + x
 
-        if obj[x]?
-          switch mapType
-            when 'bmp'
-              bmpKey = "#{dkey}:bmp:#{x}"
-              pipeline.pfadd(bmpKey, obj[x])
-            when 'add'
-              addKey = "#{dkey}:add:#{x}"
-              pipeline.hincrby(addKey, obj[x], 1)
-            when 'top'
-              topKey = "#{dkey}:top:#{x}"
-              pipeline.zincrby(topKey, 1, obj[x])
-            when 'addv'
-              if not isNaN(obj[x])
-                addvKey = "#{dkey}:addv:#{x}:#{x}"
-                totKey = "#{dkey}:addv:#{x}:i"
-                pipeline.hincrby(addvKey, obj[x], +obj[x])
-                pipeline.hincrby(totKey, 'sum', +obj[x])
-                pipeline.hincrby(totKey, 'count', 1)
+          keysQueue.push bmpKey = dkey + ':bmp:' + x
 
+          id = await bmpId(obj[x])
+          pipeline.setbit(bmpKey, id, 1)
+
+    if @map.add?.length
+      for x in @map.add
+        if x.match(/\~/)
+          x = x.split(/\~/).sort().join('~')
+
+        if obj[x]
+          addKey = dkey + ':add:' + x
+          keysQueue.push addKey
+          pipeline.hincrby(addKey, obj[x], 1)
+
+    if @map.top?.length
+      for x in @map.top
+        if x.match(/\~/)
+          x = x.split(/\~/).sort().join('~')
+
+        if obj[x]
+          setKey = dkey + ':top:' + x
+          keysQueue.push setKey
+          pipeline.zincrby(setKey, 1, obj[x])
+
+    if @map.addv?.length
+      for x in @map.addv
+
+        # @todo: enforce this structure {key, value}
+        if !_.isObject(x)
+          continue
+
+        labelKey = x.key
+        valueKey = x.addKey ? x.addKey
+
+        if labelKey.match(/\~/)
+          labelKey = labelKey.split(/\~/).sort().join('~')
+
+        if obj[labelKey] and obj[valueKey] and !isNaN(obj[valueKey])
+          addKey = dkey + ':addv:' + valueKey + ':' + labelKey
+          totKey = dkey + ':addv:' + valueKey + ':' + labelKey + ':i'
+
+          keysQueue.push addKey
+          keysQueue.push totKey
+
+          if labelKey isnt valueKey
+            pipeline.hincrby(addKey, obj[labelKey], +(obj[valueKey]))
+
+          pipeline.hincrby(totKey, 'sum', +(obj[valueKey]))
+          pipeline.hincrby(totKey, 'count', 1)
+
+    await @membersKeys.add(timebase(), keysQueue)
     await pipeline.exec()
 
-  query: (min, max, options = {}) ->
-    minDate = moment.unix(min).startOf('day')
-    maxDate = moment.unix(max).startOf('day')
-    days = maxDate.diff(minDate, 'days') + 1
+  query: (min, max, opt = {}) ->
+    dkey = @key + ':' + timebase()
 
-    results = {}
+    minDate = timebase(min)
+    maxDate = timebase(max)
 
-    for i in [0...days]
-      date = minDate.clone().add(i, 'days')
-      unix = date.unix()
-      dkey = "#{@key}:#{date.format('YYYYMMDD')}"
+    ret = {}
 
-      # @todo: implement cache get here
+    keyPromises = []
+    allDays = []
 
-      result = await @queryDay(dkey, unix, options)
-      results[unix] = result
+    currentDate = minDate
 
-    @formatResults(results, options)
+    while currentDate <= maxDate
+      keyPromises.push(@membersKeys.list(currentDate))
+      allDays.push currentDate
 
-  queryDay: (dkey, unix, options) ->
+      ret[currentDate] = {
+        date: new Date(currentDate * 1000).toISOString().split('T')[0]
+        result: []
+      }
 
-    # @todo: implement cache get here
+      currentDate += englishSecs('1 day')
 
-    pipeline = @redis.pipeline()
+    r = await Promise.all(keyPromises)
 
-    for type in ['bmp', 'add', 'top', 'addv']
-      for x in @map[type]
+    if !r?.length
+      return ret
 
-        key = "#{dkey}:#{type}:#{x}"
+    jobs = @_jobs(r)
+    jobPromises = {}
 
-        switch type
-          when 'bmp' then pipeline.pfcount(key)
-          when 'add' then pipeline.hgetall(key)
-          when 'top' then pipeline.zrevrange(key, 0, -1, 'WITHSCORES')
-          when 'addv'
-            pipeline.hgetall("#{key}:#{x}")
-            pipeline.hgetall("#{key}:i")
+    jobKeys = []
+    blacklist = []
 
-    results = await pipeline.exec()
-    formattedResults = @formatDayResults(results, unix)
+    for k,v of jobs
+      for path, func of v
+        jobKeys.push path
 
-    # @todo: implement cache put here
+    opt.ignore ?= []
+    opt.accept ?= (opt.allow ? [])
 
-    return formattedResults
+    if opt.ignore
+      opt.ignore = [opt.ignore] if typeof opt.ignore is 'string'
 
-  formatDayResults: (results, unix) ->
-    formattedResults = {unix, date: moment.unix(unix).format('YYYY-MM-DD')}
+    if opt.accept
+      opt.accept = [opt.accept] if typeof opt.accept is 'string'
 
-    index = 0
-    for type in ['bmp', 'add', 'top', 'addv']
-      for x in @map[type]
+    if opt.ignore.length
+      for x in jobKeys
+        raw = x.substr(@key.length + 1)
+        parts = raw.split ':'
+        parts.shift()
+        raw = parts.join ':'
+        for pattern in opt.ignore
+          blacklist.push(x) if minimatch(raw, pattern)
 
-        key = "#{type}:#{x}"
+    if opt.accept.length
+      for x in jobKeys
+        continue if x in blacklist
+        raw = x.substr(@key.length + 1)
+        parts = raw.split ':'
+        parts.shift()
+        raw = parts.join ':'
+        valid = no
+        for pattern in opt.accept
+          if minimatch(raw, pattern)
+            valid = yes
+            break
+        blacklist.push x if !valid
 
-        switch type
-          when 'bmp'
-            formattedResults[key] = results[index][1]
-            index++
-          when 'add', 'top'
-            formattedResults[key] = results[index][1]
-            index++
-          when 'addv'
-            values = results[index][1]
-            totals = results[index + 1][1]
-            formattedResults[key] = { values, totals }
-            index += 2
-
-    return formattedResults
-
-  formatResults: (results, options) ->
-    formatted = { days: results }
-
-    # define subquery function
-    formatted.find = (query) =>
-      if typeof query is 'string'
-        [type, key, day] = query.split('/')
+    if opt.returnJobs
+      if blacklist.length
+        return _.difference(jobKeys, blacklist)
       else
-        {type, key, day, merge} = query
-      if day
-        return results[day]?["#{type}:#{key}"]
-      else
-        dayResults = {}
-        for unix, dayData of results
-          dayResults[dayData.date] = dayData["#{type}:#{key}"]
-        if merge
-          mergedResult = {}
-          for date, data of dayResults
-            for k, v of data
-              mergedResult[k] ?= 0
-              mergedResult[k] += +v
-          return mergedResult
-        else
-          return dayResults
+        return jobKeys
 
-    return formatted
+    for k,v of jobs
+      do (k,v) ->
+        if blacklist.length
+          for k2,v2 of v
+            delete v[k2] if k2 in blacklist
 
-  # ease of use function
+        if opt.ignoreJobs
+          for x in opt.ignoreJobs
+            return if k.includes(x)
+
+        jobPromises[k] = Promise.all(Object.values(v))
+
+    r2 = await Promise.all(Object.values(jobPromises))
+
+    if !_.size(r2)
+      return ret
+
+    for type, results of r2
+      for item in results
+        if ret[item.day]
+          item.key = item.location.split(':').pop().split('~')
+          ret[item.day].result.push item
+
+    @_format(ret, no)
+
   queryDays: (numDays) ->
-    max = moment().unix()
-    min = moment().subtract(Math.abs(numDays), 'days').unix()
-    @query(min, max)
+    maxDate = timebase()
+    minDate = maxDate - (Math.abs(numDays) * (englishSecs('1 day')))
 
-module.exports = Metrics
+    @query(minDate, maxDate)
+
+  _queryKeys: (keys) ->
+    start = new Date
+
+    min = null
+    max = null
+
+    for x in keys
+      time = x.split(':')[1]
+      if !min or time < min then min = time
+      if !max or time > max then max = time
+
+    range = [min..max]
+    days = (x for x in range by (24 * 60 * 60)).reverse()
+
+    fns = @_jobs keys
+    jobPromises = {}
+
+    for k,v of fns
+      jobPromises[k] = Promise.all(Object.values(v))
+
+    r = await Promise.all(Object.values(jobPromises))
+
+    out = {
+      days: {}
+      min: min
+      max: max
+      elapsed: "#{new Date() - start}ms"
+    }
+
+    if _.keys(r).length
+      for k,v of r
+        for stats in v
+
+          if !out.days[stats.day]
+            out.days[stats.day] = {}
+
+          if !out.days[stats.day][stats.type]
+            out.days[stats.day][stats.type] = {}
+
+          mapKey = stats.location.split /:/
+          mapKey = mapKey.slice -1
+
+          out.days[stats.day][stats.type][mapKey] = stats
+
+    for x in days
+      if !out.days[x] then out.days[x] = {}
+      out.days[x].date = new Date(x * 1000).toISOString().split('T')[0]
+
+    out
+
+  _jobs: (keys) ->
+    fns =
+      add: {}
+      top: {}
+      bmp: {}
+      addv: {}
+
+    keys = _.uniq _.flatten keys
+
+    for y in keys
+      do (y) =>
+        if @key.includes(':')
+          y = y.split(@key).join('_tmp_')
+
+        [key, time, type, rest...] = y.split /:/
+
+        if y.includes('_tmp_')
+          y = y.split('_tmp_').join @key
+
+        job =
+          day: time
+          type: type
+          location: y
+
+        if job.type is 'addv'
+          [addvKey, ...fields] = rest
+          job.addvKey = addvKey
+          job.key = fields.join(':').split('~')
+        else
+          job.key = rest.join(':').split('~')
+
+        if job.type is 'add'
+          fns[job.type][job.location] = @redis.hgetall(job.location).then (r) ->
+            job.result = r
+            job
+
+        else if job.type is 'addv'
+          if job.key.includes('i')
+            # Handle the summary document
+            fns[job.type][job.location] = @redis.hgetall(job.location).then (r) ->
+              job.result =
+                sum: Number(r.sum)
+                count: Number(r.count)
+              job
+          else
+            # Handle the main addv document
+            fns[job.type][job.location] = @redis.hgetall(job.location).then (r) ->
+              job.result = {}
+              for k, v of r
+                job.result[k] = Number(v)
+              job
+
+        else if job.type is 'bmp'
+          fns[job.type][job.location] = @redis.bitcount(job.location).then (r) ->
+            job.result = r
+            job
+
+        else if job.type is 'top'
+          args = [
+            job.location
+            '+inf'
+            '-inf'
+            'WITHSCORES'
+            'LIMIT'
+            0
+            250
+          ]
+
+          fns[job.type][job.location] = @redis.zrevrangebyscore(args).then (r) ->
+            ret = {}
+            if r?.length
+              last = null
+              i = 0
+              for z in r
+                ++i
+                if i % 2
+                  ret[z] = null
+                  last = z
+                else
+                  ret[last] = parseInt z
+            job.result = ret
+            job
+
+    fns
+
+  x_jobs: (keys) ->
+    fns =
+      add: {}
+      top: {}
+      bmp: {}
+      addv: {}
+
+    keys = _.uniq _.flatten keys
+
+    for y in keys
+      do (y) =>
+        if @key.includes(':')
+          y = y.split(@key).join('_tmp_')
+
+        [key, time, type..., fields] = y.split /:/
+
+        if y.includes('_tmp_')
+          y = y.split('_tmp_').join @key
+
+        if _.first(type) is 'addv'
+          type = ['addv']
+
+        return if type.length is 2
+
+        job =
+          day: time
+          type: type.shift()
+          location: y
+
+        if job.type is 'add' or job.type is 'addv'
+          fns[job.type][job.location] = @redis.hgetall(job.location).then (r) ->
+            job.result = r
+            job
+
+        else if job.type is 'bmp'
+          fns[job.type][job.location] = @redis.bitcount(job.location).then (r) ->
+            job.result = r
+            job
+
+        else if job.type is 'top'
+          args = [
+            job.location
+            '+inf'
+            '-inf'
+            'WITHSCORES'
+            'LIMIT'
+            0
+            250
+          ]
+
+          fns[job.type][job.location] = @redis.zrevrangebyscore(args).then (r) ->
+            ret = {}
+            if r?.length
+              last = null
+              i = 0
+              for z in r
+                ++i
+                if i % 2
+                  ret[z] = null
+                  last = z
+                else
+                  ret[last] = parseInt z
+            job.result = ret
+            job
+
+    return fns
+
+  _format: (obj) ->
+    mergeNumeric = ((uno, dos) ->
+      return dos if !uno and dos
+      return uno if uno and !dos
+
+      for k,v of dos
+        uno[k] ?= 0
+        uno[k] += (+v)
+
+      return uno
+    )
+
+    output =
+      days: obj
+      find: (o) ->
+        opt = {
+          type: null
+
+          key: null
+          addKey: null
+
+          day: no
+          merge: no
+        }
+
+        if typeof o is 'object'
+          if o.keys and !o.key
+            o.key = o.keys
+            delete o.keys
+          opt = _.merge {}, opt, o
+        else
+          parts = o.split '/'
+          opt.type = parts.shift()
+          opt.key = parts.shift()
+          if parts.length
+            opt.day = parts.shift()
+
+        opt.key = opt.key.split('~').sort().join '~'
+
+        if opt.day
+          if !obj[opt.day]?.result?
+            return null
+
+          for v in obj[opt.day].result
+            if v.type is opt.type
+              if v.type is 'addv'
+                if v.addvKey is opt.addKey and v.key.sort().join('~') is opt.key
+                  return v.result
+              else if v.location.substr((opt.key.length + 1) * -1) is ":#{opt.key}"
+                return v.result
+
+          return null
+
+        else
+          ret = {}
+
+          for unix, item of obj
+            if opt.type is 'bmp'
+              val = 0
+            else if opt.type in ['top','add','addv']
+              val = {}
+
+            ret[item.date] = val
+
+            continue if !item?.result?.length
+
+            for v in item.result
+              if v.type is opt.type
+                if v.type is 'addv'
+                  if v.addvKey is opt.addKey and v.key.sort().join('~') is opt.key
+                    ret[item.date] = v.result
+                else if v.location.substr((opt.key.length + 1) * -1) is ":#{opt.key}"
+                  ret[item.date] = v.result
+
+          if opt.merge
+            tot = {}
+            arr = _.values ret
+            for x in arr
+              do (x) ->
+                tot = mergeNumeric tot, x
+            tot
+          else
+            ret
 
 if !module.parent
-  metrics = new Metrics({
-    key: 'examples'
-
-    # define the map
-    map: {
-      bmp: ['ip']
-      add: [
-        'event'
-        'event~offer'
-        'event~offer~creative'
-        'event~offer~channel'
-        'event~offer~s1'
-        'event~offer~s2'
-        'event~offer~s3'
-        'event~offer~creative~s1'
-        'event~offer~creative~s2'
-        'event~offer~creative~s3'
-      ]
-      top: [
-        'geo'
-        'offer'
-        'geo~offer'
-        'offer~creative'
-        'offer~host'
-        'offer~ref'
-      ]
-    }
-  })
-
-  # record an event
-  await metrics.record({
-    ip: '192.168.1.1'
-    event: 'offer_impression'
-    offer: '526aa9fff3e8b600000000e5'
-    creative: 'c_0'
-    geo: 'US'
-    host: 'example.com'
-    ref_host: 'google.com'
-  })
-
-  # query the last 10 days
-  results = await metrics.queryDays(10)
-  console.log(results.find('bmp/ip'))
-  console.log(results.find({type: 'add', key: 'event', merge: true}))
-  console.log(results.find('top/geo'))
+  process.exit 0
 
