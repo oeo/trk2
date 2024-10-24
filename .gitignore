@@ -30,7 +30,6 @@ yarn-lock.json
 
 # build outputs
 /dist/
-/build/
 /out/
 
 # archives
