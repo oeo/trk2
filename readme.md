@@ -42,6 +42,10 @@ await metrics.record({
 });
 ```
 
+<p>
+    <img src="./assets/redis-insight.png" width="600">
+</p>
+
 ### querying data
 
 ```javascript
