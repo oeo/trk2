@@ -107,15 +107,30 @@ finds specific metrics in the query results.
 see the `src/examples` directory for more detailed usage examples.
 
 ## performance
-apple m2 max can record she of 10k basic events per second.
+on my apple m2 max w 64gb ram
+
+coffee/node
 
 ```bash
-taky:~/www/trk2/src/examples$ coffee record-events.coffee
-Finished recording 100000 events (series) in 14436ms
-Series events digested/sec: 6927.126627874758
+taky:~/www/trk2/src$ coffee examples/record-events.coffee
 
-Finished recording 100000 events (parallel) in 10687ms
-Parallel events digested/sec: 9357.162908206232
+Finished recording 100000 events (series) in 12799ms
+Series events digested/sec: 7813.110399249942
+
+Finished recording 100000 events (parallel) in 10263ms
+Parallel events digested/sec: 9743.739647276625
+```
+
+bun
+
+```bash
+taky:~/www/trk2/build$ bun examples/record-events.js
+
+Finished recording 100000 events (series) in 10294ms
+Series events digested/sec: 9714.396735962697
+
+Finished recording 100000 events (parallel) in 7499ms
+Parallel events digested/sec: 13335.111348179758
 ```
 
 ## license

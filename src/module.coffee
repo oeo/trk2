@@ -4,8 +4,6 @@ _ = require 'lodash'
 Redis = require 'ioredis'
 minimatch = require 'minimatch'
 
-RedisMembers = require './members'
-
 englishSecs = require './english-secs'
 timebase = require './timebase'
 
@@ -14,11 +12,6 @@ module.exports = class Metrics
   constructor: (opt={}) ->
     @redis = opt.redis ? opt.client ? new Redis()
     @key = opt.key ? opt.prefix ? 'trk2'
-
-    @membersKeys = new RedisMembers {
-      redis: @redis
-      prefix: @key + ':k'
-    }
 
     @map = {
       bmp: []
@@ -30,7 +23,6 @@ module.exports = class Metrics
     if opt.map
       @map[k] = v for k,v of opt.map
 
-    # define the custom command in the constructor
     @redis.defineCommand("getIdentityAndSetBit", {
       numberOfKeys: 2,
       lua: """
@@ -47,6 +39,19 @@ module.exports = class Metrics
         redis.call("SETBIT", bmpKey, identity, 1)
 
         return identity
+      """
+    })
+
+    @redis.defineCommand("addMembers", {
+      numberOfKeys: 1,
+      lua: """
+        local key = KEYS[1]
+        local members = cjson.decode(ARGV[1])
+        local added = 0
+        for _, member in ipairs(members) do
+          added = added + redis.call('SADD', key, member)
+        end
+        return added
       """
     })
 
@@ -126,8 +131,14 @@ module.exports = class Metrics
           pipeline.hincrby(totKey, 'sum', +(obj[valueKey]))
           pipeline.hincrby(totKey, 'count', 1)
 
-    await @membersKeys.add(_timebase, keysQueue)
-    await pipeline.exec()
+    # await @membersKeys.add(_timebase, keysQueue)
+    pipeline.addMembers(@key + ':k:' + _timebase, JSON.stringify(keysQueue))
+
+    try
+      r = await pipeline.exec()
+      return r
+    catch e
+      throw e
 
   query: (min, max, opt = {}) ->
     dkey = @key + ':' + timebase()
@@ -143,7 +154,7 @@ module.exports = class Metrics
     currentDate = minDate
 
     while currentDate <= maxDate
-      keyPromises.push(@membersKeys.list(currentDate))
+      keyPromises.push(@redis.smembers(@key + ':k:' + currentDate))
       allDays.push currentDate
 
       ret[currentDate] = {
