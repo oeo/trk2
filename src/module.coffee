@@ -33,8 +33,7 @@ module.exports = class Metrics
 
   record: (event) ->
     dkey = @key + ':' + timebase()
-
-    obj = _.clone event
+    obj = _.clone(event, false) # shallow copy
 
     for x of obj
       for y of obj
